@@ -1,0 +1,65 @@
+name: Production QA
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  statuses: read
+  checks: read
+  deployments: read
+jobs:
+  production-qa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PRODUCTION_URL: https://tasksk034.vercel.app
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Source build / pre-deploy gate
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+      - name: Probe production URL
+        id: probe
+        shell: bash
+        run: |
+          live=false
+          for attempt in $(seq 1 4); do
+            code=$(curl -L -sS -o /tmp/project.html -w '%{http_code}' --max-time 20 "${PRODUCTION_URL}" || true)
+            bytes=$(wc -c < /tmp/project.html 2>/dev/null || echo 0)
+            if [[ "${code}" =~ ^[23][0-9][0-9]$ && "${bytes}" -gt 100 ]]; then live=true; break; fi
+            sleep 5
+          done
+          echo "live=${live}" >> "$GITHUB_OUTPUT"
+      - name: Waiting for Vercel Git integration
+        if: steps.probe.outputs.live != 'true'
+        run: echo "Production URL is not live yet; release approval remains blocked until Git-connected Vercel is available."
+      - name: Require exact-commit Vercel SUCCESS
+        if: steps.probe.outputs.live == 'true'
+        shell: bash
+        run: |
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/status" --jq '[.statuses[] | select(.context | test("Vercel"; "i"))][0].state // ""')
+          echo "Vercel status: ${state:-missing}" >> "$GITHUB_STEP_SUMMARY"
+          [[ "${state}" == "success" ]]
+      - name: Install Playwright
+        if: steps.probe.outputs.live == 'true'
+        run: npx playwright install --with-deps chromium
+      - name: Run multi-viewport production QA
+        if: steps.probe.outputs.live == 'true'
+        run: npm run qa
+      - name: Publish QA summary
+        if: always() && steps.probe.outputs.live == 'true'
+        run: test -f qa-artifacts/qa-summary.md && cat qa-artifacts/qa-summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Upload QA evidence
+        if: always() && steps.probe.outputs.live == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-qa-${{ github.sha }}
+          path: qa-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
